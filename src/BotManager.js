@@ -7,6 +7,20 @@ export class BotManager {
   constructor() {
     // Map key format: "username@host" (post-spawn) or "msa:discordId@host" (pre-spawn premium)
     this.bots = new Map();
+
+    // FIX: Persist authPasswords across bot removals/rejoins so AuthMe /login
+    // still works after a !leave + !join cycle on the same server.
+    // Key: "username@host", Value: password string
+    this._authPasswords = new Map();
+  }
+
+  // Retrieve or create a stable auth password for this username+host pair.
+  _getAuthPassword(username, host) {
+    const key = `${username}@${host}`;
+    if (!this._authPasswords.has(key)) {
+      this._authPasswords.set(key, Math.random().toString(36).slice(2, 12) + 'Aa1!');
+    }
+    return this._authPasswords.get(key);
   }
 
   // Join a cracked (offline-mode) server — no account required
@@ -16,10 +30,17 @@ export class BotManager {
       return channel.send(msg(`**${options.username}** is already active on **${options.host}**`));
     }
 
+    // FIX: Pass the stable persisted password into MinecraftBot instead of
+    // letting it generate a new one — so rejoin after !leave reuses the same
+    // password that was registered with AuthMe.
+    const authPassword = this._getAuthPassword(options.username, options.host);
+
     const bot = new MinecraftBot(
       { ...options, auth: 'offline' },
       channel,
-      () => this.bots.delete(key)
+      () => this.bots.delete(key),
+      null,
+      authPassword
     );
     this.bots.set(key, bot);
     bot.connect().catch((err) => console.error('[BotManager] joinCracked connect error:', err));
@@ -29,9 +50,19 @@ export class BotManager {
   // The Discord user ID is used as the stable prismarine-auth cache key,
   // so the user only needs to authenticate with Microsoft once.
   joinPremium(discordUserId, options, channel) {
-    // Detect duplicates even after the key has been updated to the real MC username
+    // FIX: Original duplicate check only compared options.username (discordUserId)
+    // which works pre-spawn but fails post-spawn once the key has been re-keyed
+    // to the real MC username (options.username never changes, but realUsername does).
+    // Now we check BOTH to correctly detect duplicates at any lifecycle stage.
     const alreadyRunning = [...this.bots.values()].some(
-      (b) => b.options.username === discordUserId && b.options.host === options.host
+      (b) =>
+        b.options.host === options.host &&
+        (
+          // Pre-spawn: options.username is still the discordUserId
+          b.options.username === discordUserId ||
+          // Post-spawn: discordId stored separately on the bot instance
+          b.discordUserId === discordUserId
+        )
     );
     if (alreadyRunning) {
       return channel.send(msg(`You already have a premium bot on **${options.host}**`));
@@ -52,6 +83,10 @@ export class BotManager {
         this.bots.set(currentKey, bot);
       }
     );
+
+    // FIX: Store discordUserId on the bot instance so the duplicate check above
+    // can find it after the key has been re-keyed to the real MC username.
+    bot.discordUserId = discordUserId;
 
     this.bots.set(currentKey, bot);
     bot.connect().catch((err) => console.error('[BotManager] joinPremium connect error:', err));
@@ -89,16 +124,13 @@ export class BotManager {
   }
 
   // Force a bot to jump, identified by username + host.
-  // Mirrors removeBot's lookup strategy so it works for both cracked and premium bots.
   jump(username, host, channel) {
-    // Direct key lookup (covers cracked bots and post-spawn premium bots)
     const exactKey = `${username}@${host}`;
     if (this.bots.has(exactKey)) {
       this.bots.get(exactKey).jump();
       return;
     }
 
-    // Linear scan for pre-spawn premium bots keyed as "msa:discordId@host"
     for (const bot of this.bots.values()) {
       if (
         bot.options.host === host &&
@@ -112,16 +144,29 @@ export class BotManager {
     channel.send(msg(`no bot named **${username}** on **${host}**`));
   }
 
-  // Send a chat message in-game through the named bot
-  say(username, text, channel) {
-    // Find bot by its real MC username (or pre-spawn options.username) — host-agnostic
-    const bot = [...this.bots.values()].find(
-      (b) => (b.realUsername || b.options.username) === username
-    );
-    if (!bot) {
-      return channel.send(msg(`no bot named **${username}** found`));
+  // FIX: say() now requires host parameter to correctly identify the bot when
+  // the same username exists on multiple servers. Signature changed from
+  // say(username, text, channel) → say(username, host, text, channel).
+  say(username, host, text, channel) {
+    // Direct key lookup first (fastest, unambiguous)
+    const exactKey = `${username}@${host}`;
+    if (this.bots.has(exactKey)) {
+      this.bots.get(exactKey).say(text);
+      return;
     }
-    bot.say(text);
+
+    // Fallback: scan for pre-spawn premium bots or bots matched by realUsername
+    for (const bot of this.bots.values()) {
+      if (
+        bot.options.host === host &&
+        (bot.realUsername === username || bot.options.username === username)
+      ) {
+        bot.say(text);
+        return;
+      }
+    }
+
+    channel.send(msg(`no bot named **${username}** on **${host}**`));
   }
 
   // Return a V2 message listing all active bots and their state
@@ -133,7 +178,7 @@ export class BotManager {
     const rows = [...this.bots.values()].map((bot) => {
       const name = bot.realUsername || bot.options.username;
       const state = bot.bot?.entity ? 'online' : 'connecting';
-      return `**${name}** — ${bot.options.host} — ${state}`;
+      return `**${name}** — ${bot.options.host}:${bot.options.port} — ${state}`;
     });
 
     const count = rows.length;
