@@ -33,6 +33,7 @@ const client = new Client({
 
 const botManager = new BotManager();
 
+
 client.on('clientReady', () => {
   if (GUILD_ID) {
     console.log(`Discord bot logged in as ${client.user.tag} — restricted to guild ${GUILD_ID}`);
@@ -47,7 +48,7 @@ const COMMANDS = [
   { usage: '!join <ip[:port]> [username]',  desc: 'Join a cracked server.' },
   { usage: '!premjoin <ip[:port]>',         desc: 'Join an online-mode server via Microsoft account.' },
   { usage: '!leave <ip> <username>',        desc: 'Disconnect a bot.' },
-  { usage: '!say <username> <message>',     desc: 'Send a chat message in-game.' },
+  { usage: '!say <ip> <username> <message>', desc: 'Send a chat message in-game.' },
   { usage: '!bots',                         desc: 'List all active bots.' },
   { usage: '!jump <ip> <username>',         desc: 'Force a bot to jump.' },
   { usage: '!help',                         desc: 'Show this reference.' },
@@ -87,6 +88,32 @@ function buildHelp() {
   return { components: [c], flags: MessageFlags.IsComponentsV2 };
 }
 
+// ─── Per-user command rate limiting ───────────────────────────────────────────
+// FIX: No rate limiting existed — any user could spam commands to spawn bots.
+// Simple cooldown map: userId → timestamp of last command.
+
+const COOLDOWN_MS = 3_000; // 3 seconds between commands per user
+const cooldowns = new Map();
+
+function isRateLimited(userId) {
+  const last = cooldowns.get(userId);
+  const now = Date.now();
+  if (last && now - last < COOLDOWN_MS) return true;
+  cooldowns.set(userId, now);
+  return false;
+}
+
+// ─── Username validation ───────────────────────────────────────────────────────
+// FIX: No validation on cracked usernames — Minecraft usernames must be
+// 3-16 chars, alphanumeric + underscores only. Invalid names cause mineflayer
+// to fail silently or produce confusing errors.
+
+const MC_USERNAME_RE = /^[a-zA-Z0-9_]{3,16}$/;
+
+function isValidUsername(name) {
+  return MC_USERNAME_RE.test(name);
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 client.on('messageCreate', async (message) => {
@@ -99,6 +126,16 @@ client.on('messageCreate', async (message) => {
   const args = message.content.trim().split(/\s+/);
   const command = args[0].toLowerCase();
 
+  // Only process known commands before rate-limit check to avoid wasting the
+  // cooldown slot on unrelated messages
+  const knownCommands = ['!help', '!join', '!premjoin', '!leave', '!say', '!bots', '!jump'];
+  if (!knownCommands.includes(command)) return;
+
+  // FIX: Rate limit check — applied after command recognition
+  if (isRateLimited(message.author.id)) {
+    return message.reply(msg('-# Please wait a moment before sending another command.'));
+  }
+
   // !help
   if (command === '!help') {
     return message.reply(buildHelp());
@@ -110,6 +147,12 @@ client.on('messageCreate', async (message) => {
     const [host, rawPort] = args[1].split(':');
     const port = parseInt(rawPort) || 25565;
     const username = args[2] || `AFK_${Math.floor(Math.random() * 9999)}`;
+
+    // FIX: Validate username before attempting to connect
+    if (!isValidUsername(username)) {
+      return message.reply(msg(`invalid username **${username}**\n-# Must be 3-16 characters, letters/numbers/underscores only.`));
+    }
+
     botManager.joinCracked({ host, port, username }, message.channel);
     return;
   }
@@ -131,12 +174,17 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // !say <username> <message...>  —  send an in-game chat message through the named bot
+  // FIX: !say now requires <ip> so BotManager can find the correct bot when
+  // the same username exists on multiple servers.
+  // New usage: !say <ip> <username> <message...>
   if (command === '!say') {
-    if (!args[1] || !args[2]) return message.reply(msg('usage: `!say <username> <message>`'));
-    const username = args[1];
-    const chatText = args.slice(2).join(' ');
-    botManager.say(username, chatText, message.channel);
+    if (!args[1] || !args[2] || !args[3]) {
+      return message.reply(msg('usage: `!say <ip> <username> <message>`'));
+    }
+    const [host] = args[1].split(':');
+    const username = args[2];
+    const chatText = args.slice(3).join(' ');
+    botManager.say(username, host, chatText, message.channel);
     return;
   }
 

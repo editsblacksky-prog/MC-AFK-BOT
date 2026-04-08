@@ -57,8 +57,9 @@ export class MinecraftBot {
    * @param {object}   discordChannel   Discord TextChannel to send status messages to
    * @param {Function} onFatal          called when the bot permanently fails and is removed
    * @param {Function} onRealUsername   called with the real MC username after first spawn
+   * @param {string}   [authPassword]   optional stable password injected by BotManager (cracked bots)
    */
-  constructor(options, discordChannel, onFatal, onRealUsername) {
+  constructor(options, discordChannel, onFatal, onRealUsername, authPassword) {
     this.options = options;
     this.discordChannel = discordChannel;
     this.onFatal = onFatal;
@@ -73,8 +74,13 @@ export class MinecraftBot {
     this.reconnectAttempts = 0;
     this.spawnedOnce = false;
     this.realUsername = null;
-    // Stable password across reconnects so auth-plugin /login works after initial /register
-    this.authPassword = Math.random().toString(36).slice(2, 12) + 'Aa1!';
+
+    // FIX: Accept an externally injected password from BotManager so that
+    // a !leave + !join cycle on the same server reuses the original registered
+    // password and AuthMe /login still succeeds.
+    // Falls back to generating a fresh one only when BotManager doesn't supply one
+    // (e.g. premium bots that don't need AuthMe registration).
+    this.authPassword = authPassword || (Math.random().toString(36).slice(2, 12) + 'Aa1!');
   }
 
   // Safely send a V2 container message to Discord; swallows channel errors
@@ -84,10 +90,10 @@ export class MinecraftBot {
 
   // ─── Microsoft pre-authentication ────────────────────────────────────────────
   //
-  // Bug: mineflayer opens the TCP connection to the Minecraft server first, then
-  // waits for the server handshake before starting OAuth. If the server is
-  // unreachable (ECONNREFUSED, ENOTFOUND, etc.) the error fires before onMsaCode
-  // is ever called — so the user never sees the login link and the bot is removed.
+  // Bug (original): mineflayer opens the TCP connection to the Minecraft server
+  // first, then waits for the server handshake before starting OAuth. If the
+  // server is unreachable the error fires before onMsaCode is ever called —
+  // the user never sees the login link and the bot is silently removed.
   //
   // Fix: call prismarine-auth directly BEFORE creating the mineflayer bot so the
   // OAuth flow (and Discord prompt) completes first. The token is then cached at
@@ -149,6 +155,10 @@ export class MinecraftBot {
   // ─── Connection ───────────────────────────────────────────────────────────────
 
   async connect() {
+    // FIX: Guard against connect() being called after stop() — e.g. if a
+    // reconnect timer fires after an explicit !leave command races with it.
+    if (this.isStopping || this.isFatal) return;
+
     this.isDisconnecting = false;
 
     // Remove all listeners from any previous bot instance before creating a new one.
@@ -167,6 +177,10 @@ export class MinecraftBot {
       if (!ok) return; // auth failed — fatal error already reported
     }
 
+    // FIX: Re-check isStopping after the async _preAuth call — !leave may have
+    // been called while waiting for OAuth to complete.
+    if (this.isStopping || this.isFatal) return;
+
     // Token is now cached at MS_CACHE_DIR; mineflayer will read it silently.
     // No onMsaCode needed — the token is guaranteed to be present.
     const botOptions = {
@@ -182,6 +196,9 @@ export class MinecraftBot {
     this.bot.loadPlugin(pathfinder);
 
     this.bot.on('spawn', () => {
+      // FIX: Guard — if stop() was called between createBot and spawn, abort
+      if (this.isStopping || this.isFatal) return;
+
       this.reconnectAttempts = 0;
       this.isDisconnecting = false;
       const name = this.bot.username;
@@ -243,7 +260,7 @@ export class MinecraftBot {
     });
 
     this.bot.on('kicked', (reason) => {
-      if (this.isStopping || this.isDisconnecting) return;
+      if (this.isStopping || this.isFatal || this.isDisconnecting) return;
       this.isDisconnecting = true;
       const name = this.bot?.username || this.realUsername || this.options.username;
       const readable = parseKickReason(reason);
@@ -256,6 +273,9 @@ export class MinecraftBot {
       this.handleDisconnect();
     });
 
+    // FIX: 'end' fires AFTER 'kicked' in mineflayer — original code checked
+    // isDisconnecting but could still double-fire handleDisconnect if a kick
+    // + end raced. Added isFatal guard to cover the error → stop() → end path.
     this.bot.on('end', () => {
       if (this.isStopping || this.isFatal || this.isDisconnecting) return;
       this.isDisconnecting = true;
