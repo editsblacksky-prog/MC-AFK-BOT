@@ -1,6 +1,6 @@
 {
   "name": "mc-afk-bot",
-  "version": "1.0.0",
+  "version": "1.21.0",
   "description": "Minecraft AFK bot controlled via Discord",
   "main": "src/index.js",
   "type": "module",
